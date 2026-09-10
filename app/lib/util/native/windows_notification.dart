@@ -1,10 +1,14 @@
+import 'dart:async';
 import 'dart:ffi' as ffi;
-import 'dart:io' show Platform;
+import 'dart:io';
 import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:localsend_app/gen/strings.g.dart';
+import 'package:localsend_app/util/native/open_folder.dart';
+import 'package:localsend_app/util/native/tray_helper.dart';
+import 'package:window_manager/window_manager.dart';
 
 /// Where a toast click should lead in Explorer.
 /// - [folderPath] with non-null [fileName]: select that file/folder in Explorer.
@@ -35,6 +39,14 @@ class WindowsNotification {
   late final ffi.DynamicLibrary? _lib;
 
   bool _identityEnsured = false;
+  bool _activationAttached = false;
+
+  /// Receives the toast `launch` payload when the user clicks a toast.
+  ///
+  /// Must stay referenced for the lifetime of the process: the native side
+  /// calls into it from a WinRT thread.
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Pointer<Utf16>)> _activationCallable =
+      ffi.NativeCallable<ffi.Void Function(ffi.Pointer<Utf16>)>.listener(_onNativeActivation);
 
   /// Pending "open this file in Explorer" action, consumed when the app is
   /// activated (single-instance handshake after a toast click).
@@ -94,7 +106,12 @@ class WindowsNotification {
   }
 
   /// Shows a toast. Returns the native result code (0 = ok, null = skipped).
-  Future<int?> show({required String title, required String body, String? tag}) async {
+  Future<int?> show({
+    required String title,
+    required String body,
+    String? tag,
+    String? launch,
+  }) async {
     if (!Platform.isWindows || _lib == null) {
       return null;
     }
@@ -105,8 +122,10 @@ class WindowsNotification {
           ffi.Pointer<ffi.Uint16>,
           ffi.Pointer<ffi.Uint16>,
           ffi.Pointer<ffi.Uint16>,
+          ffi.Pointer<ffi.Uint16>,
         ),
         int Function(
+          ffi.Pointer<ffi.Uint16>,
           ffi.Pointer<ffi.Uint16>,
           ffi.Pointer<ffi.Uint16>,
           ffi.Pointer<ffi.Uint16>,
@@ -116,10 +135,9 @@ class WindowsNotification {
       return _withNativeString(appId, (appIdPtr) {
         return _withNativeString(title, (titlePtr) {
           return _withNativeString(body, (bodyPtr) {
-            if (tag == null || tag.isEmpty) {
-              return fn(appIdPtr, titlePtr, bodyPtr, ffi.nullptr);
-            }
-            return _withNativeString(tag, (tagPtr) => fn(appIdPtr, titlePtr, bodyPtr, tagPtr));
+            return _withOptionalNativeString(tag, (tagPtr) {
+              return _withOptionalNativeString(launch, (launchPtr) => fn(appIdPtr, titlePtr, bodyPtr, tagPtr, launchPtr));
+            });
           });
         });
       });
@@ -139,6 +157,7 @@ class WindowsNotification {
       title: t.notificationToasts.appTitle,
       body: t.notificationToasts.enabledNotice,
       tag: 'test',
+      launch: 'action=home',
     );
     debugPrint('[WindowsNotification] test toast result: $code');
     return code;
@@ -150,6 +169,7 @@ class WindowsNotification {
       return;
     }
     await ensureRegistered();
+    await attachActivationHandler();
     _identityEnsured = true;
   }
 
@@ -194,7 +214,7 @@ class WindowsNotification {
       body = t.notificationToasts.startFiles(count: count);
     }
 
-    await show(title: senderAlias, body: body, tag: 'receive-start');
+    await show(title: senderAlias, body: body, tag: 'receive-start', launch: 'action=home');
     _pendingOpenTarget = null;
     _pendingHome = true;
   }
@@ -252,7 +272,7 @@ class WindowsNotification {
       }
     }
 
-    await show(title: t.notificationToasts.appTitle, body: body, tag: 'receive-finish');
+    await show(title: t.notificationToasts.appTitle, body: body, tag: 'receive-finish', launch: _revealLaunch(target));
     _pendingHome = target == null;
     _pendingOpenTarget = target;
   }
@@ -277,6 +297,120 @@ class WindowsNotification {
     }
     _pendingHome = false;
     return true;
+  }
+
+  /// Registers the native click callback (idempotent). Called lazily before the
+  /// first toast is shown, so every displayed toast can be clicked.
+  Future<void> attachActivationHandler() async {
+    if (_activationAttached || !Platform.isWindows || _lib == null) {
+      return;
+    }
+    try {
+      final fn = _lib!.lookupFunction<
+        ffi.Int32 Function(ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<Utf16>)>>),
+        int Function(ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<Utf16>)>>)
+      >('ls_toast_set_activation_callback');
+      fn(_activationCallable.nativeFunction);
+      _activationAttached = true;
+      debugPrint('[WindowsNotification] activation handler attached');
+    } catch (e) {
+      debugPrint('[WindowsNotification] attachActivationHandler failed: $e');
+    }
+  }
+
+  /// Native -> Dart entry point. Runs on a WinRT thread, so it must not block.
+  static void _onNativeActivation(ffi.Pointer<Utf16> argsPtr) {
+    final args = argsPtr.address == 0 ? '' : argsPtr.toDartString();
+    _log('native activation: $args');
+    debugPrint('[WindowsNotification] toast clicked: $args');
+    // ignore: discarded_futures
+    unawaited(_handleActivation(args));
+  }
+
+  /// Executes a toast click: brings the panel forward and, for finish toasts,
+  /// reveals the received file/folder in Explorer. This does not depend on a
+  /// second instance being launched, so it works whenever the app is running
+  /// (including when it sits in the tray).
+  static Future<void> _handleActivation(String args) async {
+    _log('handle start args=$args');
+    await _focusPanel();
+
+    final Map<String, String> params;
+    try {
+      params = Uri.splitQueryString(args);
+    } catch (e) {
+      _log('bad launch payload: $e');
+      return;
+    }
+    if (params['action'] != 'reveal') {
+      _log('action=${params['action']} -> panel only');
+      return;
+    }
+    final dir = params['dir'];
+    if (dir == null || dir.isEmpty) {
+      _log('reveal without dir');
+      return;
+    }
+    final file = params['file'];
+    try {
+      await openFolder(folderPath: dir, fileName: (file == null || file.isEmpty) ? null : file);
+      _log('revealed dir=$dir file=$file');
+    } catch (e) {
+      _log('reveal failed: $e');
+    }
+  }
+
+  /// Shows and focuses the main window. Windows may refuse the first
+  /// foreground request, so this retries and finally forces topmost briefly.
+  static Future<void> _focusPanel() async {
+    try {
+      await showFromTray();
+    } catch (e) {
+      _log('showFromTray failed: $e');
+    }
+    try {
+      await windowManager.restore();
+      await windowManager.focus();
+      for (var i = 0; i < 10; i++) {
+        if (await windowManager.isFocused()) {
+          _log('panel focused (attempt ${i + 1})');
+          return;
+        }
+        await Future.delayed(const Duration(milliseconds: 120));
+        await windowManager.focus();
+      }
+      // Last resort: a short topmost flip makes Windows grant the foreground.
+      await windowManager.setAlwaysOnTop(true);
+      await windowManager.focus();
+      await windowManager.setAlwaysOnTop(false);
+      _log('focus fallback used, focused=${await windowManager.isFocused()}');
+    } catch (e) {
+      _log('focus retry failed: $e');
+    }
+  }
+
+  /// Diagnostic log for release builds (which have no console output).
+  static void _log(String message) {
+    try {
+      final file = File('${Directory.systemTemp.path}${Platform.pathSeparator}localsend_toast_click.log');
+      file.writeAsStringSync('${DateTime.now().toIso8601String()} $message\n', mode: FileMode.append, flush: true);
+    } catch (_) {
+      // Logging must never break activation handling.
+    }
+  }
+
+  /// Builds the `launch` payload for a finish toast.
+  static String _revealLaunch(ToastOpenTarget? target) {
+    if (target == null) {
+      return 'action=home';
+    }
+    return Uri(
+      queryParameters: <String, String>{
+        'action': 'reveal',
+        'dir': target.folderPath,
+        if (target.fileName != null && target.fileName!.isNotEmpty) 'file': target.fileName!,
+      },
+    ).query;
   }
 
   // --- text/target helpers -------------------------------------------------
@@ -343,6 +477,18 @@ class WindowsNotification {
       debugPrint('[WindowsNotification] show/ensure failed: $e');
       return null;
     }
+  }
+
+  /// Like [_withNativeString] but passes nullptr for null/empty values, which
+  /// the native side treats as "not set".
+  static int _withOptionalNativeString(
+    String? value,
+    int Function(ffi.Pointer<ffi.Uint16>) action,
+  ) {
+    if (value == null || value.isEmpty) {
+      return action(ffi.nullptr);
+    }
+    return _withNativeString(value, action);
   }
 
   static int _withNativeString(

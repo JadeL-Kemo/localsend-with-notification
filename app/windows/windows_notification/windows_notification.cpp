@@ -30,15 +30,35 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cwchar>
+#include <deque>
+#include <functional>
+#include <future>
+#include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace {
 
 constexpr wchar_t kLnkFileName[] = L"LocalSend Notification.lnk";
 constexpr wchar_t kLnkName[] = L"LocalSend Notification";
+
+using LsActivationCallback = void(__cdecl*)(const wchar_t*);
+
+/// Registered by the Dart side via ls_toast_set_activation_callback.
+LsActivationCallback g_activation_callback = nullptr;
+
+/// Live toast objects, keyed by tag. They are kept alive (and thereby stay
+/// subscribed to Activated) for the lifetime of the process. A toast shown by a
+/// previous process cannot be observed from here anyway.
+std::map<std::wstring, winrt::Windows::UI::Notifications::ToastNotification> g_live_toasts;
+
+/// Guards g_activation_callback and g_live_toasts (touched from several threads).
+std::mutex g_mutex;
 
 void NotifyLog(const wchar_t* format, ...) {
   wchar_t buf[1024];
@@ -60,6 +80,102 @@ void NotifyLog(const wchar_t* format, ...) {
     fwprintf(f, L"%s\n", buf);
     fclose(f);
   }
+}
+
+/// Brings one of our own top-level windows to the foreground. Native fallback so
+/// that a clicked "show the panel" toast never depends on Dart timing.
+void FocusOwnWindow() {
+  struct Search {
+    DWORD pid;
+    HWND found;
+  } search{GetCurrentProcessId(), nullptr};
+
+  EnumWindows(
+      [](HWND hwnd, LPARAM param) -> BOOL {
+        auto* s = reinterpret_cast<Search*>(param);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != s->pid || GetWindow(hwnd, GW_OWNER) != nullptr) {
+          return TRUE;
+        }
+        wchar_t title[256]{};
+        GetWindowTextW(hwnd, title, 256);
+        if (title[0] == L'\0') {
+          return TRUE;  // skip helper/tool windows
+        }
+        s->found = hwnd;
+        return FALSE;
+      },
+      reinterpret_cast<LPARAM>(&search));
+
+  if (search.found == nullptr) {
+    NotifyLog(L"focus: no window found");
+    return;
+  }
+  HWND hwnd = search.found;
+  if (IsIconic(hwnd)) {
+    ShowWindow(hwnd, SW_RESTORE);
+  } else {
+    ShowWindow(hwnd, SW_SHOW);
+  }
+  const HWND foreground = GetForegroundWindow();
+  const DWORD foreground_thread = foreground != nullptr ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+  const DWORD current_thread = GetCurrentThreadId();
+  bool attached = false;
+  if (foreground_thread != 0 && foreground_thread != current_thread) {
+    attached = AttachThreadInput(foreground_thread, current_thread, TRUE) != 0;
+  }
+  SetForegroundWindow(hwnd);
+  BringWindowToTop(hwnd);
+  if (attached) {
+    AttachThreadInput(foreground_thread, current_thread, FALSE);
+  }
+  NotifyLog(L"focus: hwnd=%p done", hwnd);
+}
+
+/// Toasts are created on one long-lived MTA thread. Creating them on throwaway
+/// threads (one per Dart `Isolate.run` call) lets the COM apartment be torn down
+/// while the toast is still alive, which silently kills its Activated
+/// subscription - that is why some notifications could not be clicked.
+std::mutex g_worker_mutex;
+std::condition_variable g_worker_cv;
+std::deque<std::function<void()>> g_worker_queue;
+
+void EnsureToastWorker() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::thread([] {
+      winrt::init_apartment(winrt::apartment_type::multi_threaded);
+      NotifyLog(L"toast worker started");
+      for (;;) {
+        std::function<void()> task;
+        {
+          std::unique_lock<std::mutex> lock(g_worker_mutex);
+          g_worker_cv.wait(lock, [] { return !g_worker_queue.empty(); });
+          task = std::move(g_worker_queue.front());
+          g_worker_queue.pop_front();
+        }
+        try {
+          task();
+        } catch (...) {
+          NotifyLog(L"toast worker: task threw");
+        }
+      }
+    }).detach();
+  });
+}
+
+/// Runs [task] on the toast worker thread and returns its result.
+int RunOnToastWorker(std::function<int()> task) {
+  EnsureToastWorker();
+  auto promise = std::make_shared<std::promise<int>>();
+  auto future = promise->get_future();
+  {
+    std::lock_guard<std::mutex> lock(g_worker_mutex);
+    g_worker_queue.push_back([task = std::move(task), promise]() { promise->set_value(task()); });
+  }
+  g_worker_cv.notify_one();
+  return future.get();
 }
 
 std::wstring XmlEscape(const std::wstring& in) {
@@ -90,6 +206,86 @@ std::wstring StartMenuLnkPath() {
   }
   path += kLnkFileName;
   return path;
+}
+
+/// Shows the toast on the worker thread (which owns the MTA apartment). Toast
+/// objects are kept alive in g_live_toasts so their Activated subscription
+/// survives until the process exits.
+int ShowToast(const std::wstring& app_id, const std::wstring& title,
+              const std::wstring& body, const std::wstring& tag,
+              const std::wstring& launch) {
+  NotifyLog(L"show(app_id=%s, title=%s, tag=%s)", app_id.c_str(), title.c_str(), tag.c_str());
+  if (app_id.empty() || title.empty()) {
+    NotifyLog(L"show: invalid args");
+    return -1;
+  }
+  try {
+    std::wstring xml = L"<toast";
+    if (!launch.empty()) {
+      // Payload round-tripped to the activation callback on click.
+      xml += L" launch=\"" + XmlEscape(launch) + L"\"";
+    }
+    xml += L"><visual><binding template=\"ToastGeneric\"><text>" +
+           XmlEscape(title) + L"</text><text>" + XmlEscape(body) +
+           L"</text></binding></visual></toast>";
+
+    winrt::Windows::Data::Xml::Dom::XmlDocument doc;
+    doc.LoadXml(xml);
+    winrt::Windows::UI::Notifications::ToastNotification toast(doc);
+    if (!tag.empty()) {
+      toast.Tag(winrt::hstring(tag));
+    }
+
+    // Subscribe before showing: while our process runs, a click must reach us
+    // (with its payload) instead of silently relaunching the executable.
+    toast.Activated([launch](const winrt::Windows::UI::Notifications::ToastNotification&,
+                             const winrt::Windows::Foundation::IInspectable&) {
+      NotifyLog(L"activated: launch=%s", launch.c_str());
+      // Native fallback: reveal the panel right here instead of relying on Dart
+      // being able to take the foreground.
+      if (launch.rfind(L"action=home", 0) == 0) {
+        FocusOwnWindow();
+      }
+      LsActivationCallback callback = nullptr;
+      {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        callback = g_activation_callback;
+      }
+      if (callback != nullptr) {
+        callback(launch.c_str());
+      } else {
+        NotifyLog(L"activated: no Dart callback registered, ignored");
+      }
+    });
+
+    // Keep the object alive so the Activated subscription stays valid.
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      const std::wstring slot = !tag.empty() ? tag : std::wstring(L"__default__");
+      g_live_toasts.insert_or_assign(slot, toast);
+    }
+
+    try {
+      auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(
+          winrt::hstring(app_id));
+      NotifyLog(L"show: notifier created, calling Show()");
+      notifier.Show(toast);
+      NotifyLog(L"show: Show() returned without exception");
+      return 0;
+    } catch (winrt::hresult_error const& e) {
+      NotifyLog(L"show: notifier/Show hr=0x%08X", e.code());
+      return -(200 + (e.code() & 0x7FFF));  // ~ -20105 = E_ILLEGAL_METHOD_CALL etc.
+    } catch (...) {
+      NotifyLog(L"show: notifier/Show unknown exception");
+      return -2;
+    }
+  } catch (winrt::hresult_error const& e) {
+    NotifyLog(L"show: WinRT hr=0x%08X", e.code());
+    return -(100 + (e.code() & 0x7FFF));  // carries HRESULT low bits for debugging.
+  } catch (...) {
+    NotifyLog(L"show: unknown exception");
+    return -3;
+  }
 }
 
 }  // namespace
@@ -237,59 +433,35 @@ __declspec(dllexport) int ls_toast_ensure_identity(const wchar_t* app_id) noexce
   return 0;
 }
 
-// Shows a toast notification with the given title/body. `tag` may be nullptr.
-// Returns 0 on success; -1 invalid args; -2 notifier/identity; -3 other;
-// -(100/200 + HRESULT low bits) on WinRT exceptions.
+// Shows a toast notification with the given title/body. `tag` and `launch` may
+// be nullptr. `launch` is handed back verbatim when the user clicks the toast
+// (see ls_toast_set_activation_callback), so it carries the click action.
+// The work runs on the long-lived toast worker thread - see ShowToast for the
+// result codes (0 = ok, -1 = invalid args, -2/-3 = WinRT failures,
+// -(100/200 + low HRESULT bits) on exceptions).
 __declspec(dllexport) int ls_toast_show(const wchar_t* app_id, const wchar_t* title,
-                                        const wchar_t* body, const wchar_t* tag) noexcept {
-  NotifyLog(L"show(app_id=%s, title=%s, tag=%s)", app_id != nullptr ? app_id : L"(null)",
-            title != nullptr ? title : L"(null)", tag != nullptr ? tag : L"(null)");
-  if (app_id == nullptr || app_id[0] == L'\0' || title == nullptr || body == nullptr) {
-    NotifyLog(L"show: invalid args");
-    return -1;
+                                        const wchar_t* body, const wchar_t* tag,
+                                        const wchar_t* launch) noexcept {
+  // Copy everything first: the caller's buffers are not valid on the worker.
+  return RunOnToastWorker([app_id_str = std::wstring(app_id != nullptr ? app_id : L""),
+                           title_str = std::wstring(title != nullptr ? title : L""),
+                           body_str = std::wstring(body != nullptr ? body : L""),
+                           tag_str = std::wstring(tag != nullptr ? tag : L""),
+                           launch_str = std::wstring(launch != nullptr ? launch : L"")]() {
+    return ShowToast(app_id_str, title_str, body_str, tag_str, launch_str);
+  });
+}
+
+// Registers the Dart callback for toast clicks (nullptr clears it). The
+// callback runs on a WinRT thread and receives the toast's `launch` payload.
+// Returns 0 always.
+__declspec(dllexport) int ls_toast_set_activation_callback(LsActivationCallback callback) noexcept {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_activation_callback = callback;
   }
-  try {
-    // Make sure the current thread has a COM apartment; harmless if the thread
-    // was already initialized (e.g. STA on the UI thread of a test host).
-    try {
-      winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    } catch (...) {
-      // Already initialized on this thread.
-    }
-
-    const std::wstring xml =
-        L"<toast><visual><binding template=\"ToastGeneric\"><text>" +
-        XmlEscape(title) + L"</text><text>" + XmlEscape(body) +
-        L"</text></binding></visual></toast>";
-
-    winrt::Windows::Data::Xml::Dom::XmlDocument doc;
-    doc.LoadXml(xml);
-    winrt::Windows::UI::Notifications::ToastNotification toast(doc);
-    if (tag != nullptr && tag[0] != L'\0') {
-      toast.Tag(winrt::hstring(tag));
-    }
-
-    try {
-      auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(
-          winrt::hstring(app_id));
-      NotifyLog(L"show: notifier created, calling Show()");
-      notifier.Show(toast);
-      NotifyLog(L"show: Show() returned without exception");
-      return 0;
-    } catch (winrt::hresult_error const& e) {
-      NotifyLog(L"show: notifier/Show hr=0x%08X", e.code());
-      return -(200 + (e.code() & 0x7FFF));  // ~ -20105 = E_ILLEGAL_METHOD_CALL etc.
-    } catch (...) {
-      NotifyLog(L"show: notifier/Show unknown exception");
-      return -2;
-    }
-  } catch (winrt::hresult_error const& e) {
-    NotifyLog(L"show: WinRT hr=0x%08X", e.code());
-    return -(100 + (e.code() & 0x7FFF));  // carries HRESULT low bits for debugging.
-  } catch (...) {
-    NotifyLog(L"show: unknown exception");
-    return -3;
-  }
+  NotifyLog(L"set_activation_callback: %s", callback != nullptr ? L"registered" : L"cleared");
+  return 0;
 }
 
 }  // extern "C"
